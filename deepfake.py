@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """
-deepfake.py — Webcam → Deep-Live-Cam face-swap → MJPEG HTTP stream
+deepfake.py — Webcam/video → Deep-Live-Cam face-swap → MJPEG HTTP stream
 
 Usage:
     python deepfake.py -s ref_image.png --execution-provider cuda
+    python deepfake.py -s ref_image.png --driving /path/to/driving_video.mp4
 
 Options:
     -s / --source       Path to source face image (required)
-    --camera-index      V4L2 camera index (default: 0)
-    --width             Capture width  (default: 640)
-    --height            Capture height (default: 480)
-    --fps               Target capture FPS (default: 30)
+    --driving           Driving input: V4L2 camera index (e.g. 0) or a path
+                         to a video file (default: 0). Video files stop when
+                         they reach the end unless --loop is given.
+    --loop              Loop the driving video instead of stopping at the
+                         end (video files only; ignored for a webcam).
+    --width             Capture width  (default: 640, webcam only)
+    --height            Capture height (default: 480, webcam only)
+    --fps               Target capture FPS (default: 30, webcam only)
     --port              MJPEG HTTP port (default: 8080)
     --jpeg-quality      MJPEG JPEG quality 1-100 (default: 85)
+    --output            Also save swapped output to
+                         ./output/{source}_{driving}....mp4
     --frame-processor   One or more processors (default: face_swapper)
     --many-faces        Process every face in the frame
     --execution-provider  cuda | rocm | coreml | dml | cpu  (default: auto)
@@ -22,6 +29,7 @@ Options:
 
 import os
 import sys
+from pathlib import Path
 
 # ── bootstrap: make sure the project root (where `modules/` lives) is on the
 #    path, regardless of where Python was invoked from.  This mirrors what
@@ -61,6 +69,7 @@ import time
 import signal
 import argparse
 import threading
+import subprocess
 
 # ── single-thread OMP tweak must happen before torch/onnx imports ──────────
 if any(a.startswith('--execution-provider') for a in sys.argv):
@@ -235,34 +244,83 @@ def release_resources() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Webcam capture thread
+# Driving input capture thread (webcam or video file)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class WebcamCapture:
+def _is_camera_index(driving: str) -> bool:
+    """A plain integer string (e.g. '0', '1') means a V4L2 camera index;
+    anything else (a path, an rtsp:// URL, etc.) is opened as a video source."""
+    return driving.isdigit()
+
+
+def _default_output_path(source: str, driving: str) -> str:
+    """Auto-generate ./output/{source}_{driving}....mp4 from --source/--driving."""
+    source_name = Path(source).stem
+    if _is_camera_index(driving):
+        driving_name = f"cam{driving}_{time.strftime('%Y%m%d_%H%M%S')}"
+    else:
+        driving_name = Path(driving).stem
+    out_dir = Path(_PROJECT_ROOT) / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return str(out_dir / f"{source_name}_{driving_name}.mp4")
+
+
+class DrivingCapture:
     """
-    Grabs frames from a V4L2 webcam in a background thread so the main loop
-    never stalls waiting on the camera driver.
+    Grabs frames from either a live V4L2 webcam or a video file in a
+    background thread so the main loop never stalls on I/O.
+
+    Video files stop when they reach the end (pass loop=True to rewind to
+    frame 0 instead), and are paced to their own frame rate so playback
+    doesn't just blast through the file as fast as it decodes.
     """
 
-    def __init__(self, index: int = 0, width: int = 640, height: int = 480, fps: int = 30):
-        # CAP_V4L2 = cv2.CAP_V4L2 on Linux; fall back to default backend elsewhere
-        backend = getattr(cv2, 'CAP_V4L2', cv2.CAP_ANY)
-        self._cap = cv2.VideoCapture(index, backend)
+    def __init__(self, driving: str = "0", width: int = 640, height: int = 480, fps: int = 30,
+                 loop: bool = False):
+        self._is_file = not _is_camera_index(driving)
+        self._loop    = loop
+        self._ended   = threading.Event()
 
-        if not self._cap.isOpened():
-            # retry with default backend
-            self._cap = cv2.VideoCapture(index)
+        if self._is_file:
+            self._cap = cv2.VideoCapture(driving)
+            if not self._cap.isOpened():
+                raise RuntimeError(f"Cannot open driving video: {driving}")
 
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Cannot open camera index {index}")
+            file_fps = self._cap.get(cv2.CAP_PROP_FPS)
+            self._frame_interval = 1.0 / file_fps if file_fps and file_fps > 0 else 1.0 / fps
+            self.fps = file_fps if file_fps and file_fps > 0 else fps
 
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._cap.set(cv2.CAP_PROP_FPS,          fps)
+            print(f"[driving] Opened video file {driving}  "
+                  f"{int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))}×"
+                  f"{int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}  "
+                  f"{file_fps:.1f} fps ({'looping' if loop else 'stops at end'})")
+        else:
+            index = int(driving)
+            # CAP_V4L2 = cv2.CAP_V4L2 on Linux; fall back to default backend elsewhere
+            backend = getattr(cv2, 'CAP_V4L2', cv2.CAP_ANY)
+            self._cap = cv2.VideoCapture(index, backend)
 
-        # MJPG gives better USB bandwidth utilisation on most webcams
-        fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-        self._cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            if not self._cap.isOpened():
+                # retry with default backend
+                self._cap = cv2.VideoCapture(index)
+
+            if not self._cap.isOpened():
+                raise RuntimeError(f"Cannot open camera index {index}")
+
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            self._cap.set(cv2.CAP_PROP_FPS,          fps)
+
+            # MJPG gives better USB bandwidth utilisation on most webcams
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            self._cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
+            self.fps = self._cap.get(cv2.CAP_PROP_FPS) or fps
+
+            print(f"[camera] Opened camera {index}  "
+                  f"{int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))}×"
+                  f"{int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}  "
+                  f"{self._cap.get(cv2.CAP_PROP_FPS):.0f} fps")
 
         self._frame: np.ndarray | None = None
         self._lock   = threading.Lock()
@@ -270,22 +328,37 @@ class WebcamCapture:
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
-        print(f"[camera] Opened camera {index}  "
-              f"{int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))}×"
-              f"{int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}  "
-              f"{self._cap.get(cv2.CAP_PROP_FPS):.0f} fps")
-
     def _reader(self):
         while not self._stop.is_set():
+            t_start = time.time()
             ok, frame = self._cap.read()
-            if ok:
-                with self._lock:
-                    self._frame = frame   # BGR uint8
+            if not ok:
+                if self._is_file:
+                    if self._loop:
+                        self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        continue
+                    else:
+                        # reached end of file and not looping — stop reading
+                        self._ended.set()
+                        return
+                else:
+                    continue
+            with self._lock:
+                self._frame = frame   # BGR uint8
+            if self._is_file:
+                # pace software decoding to the source video's own fps
+                remaining = self._frame_interval - (time.time() - t_start)
+                if remaining > 0:
+                    time.sleep(remaining)
 
     def read(self) -> np.ndarray | None:
         """Return the latest BGR frame, or None if none yet."""
         with self._lock:
             return None if self._frame is None else self._frame.copy()
+
+    def finished(self) -> bool:
+        """True once a non-looping driving video has reached its end."""
+        return self._ended.is_set()
 
     def stop(self):
         self._stop.set()
@@ -303,16 +376,23 @@ def parse_args():
     )
     ap.add_argument('-s', '--source',      required=True,
                     help='Source face image')
-    ap.add_argument('--camera-index',      type=int, default=0,
-                    help='V4L2 camera index (default: 0)')
+    ap.add_argument('--driving',           default='0',
+                    help='Driving input: V4L2 camera index (e.g. 0) or a '
+                         'path to a video file (default: 0)')
+    ap.add_argument('--loop',              action='store_true', default=False,
+                    help='Loop the driving video instead of stopping at '
+                         'the end (video files only)')
     ap.add_argument('--width',             type=int, default=640)
     ap.add_argument('--height',            type=int, default=480)
     ap.add_argument('--fps',               type=int, default=30,
-                    help='Target capture FPS (default: 30)')
+                    help='Target capture FPS (webcam only; default: 30)')
     ap.add_argument('--port',              type=int, default=8080,
                     help='MJPEG HTTP port (default: 8080)')
     ap.add_argument('--jpeg-quality',      type=int, default=85,
                     help='MJPEG JPEG quality 1-100 (default: 85)')
+    ap.add_argument('--output',            action='store_true', default=False,
+                    help='Also save swapped output to '
+                         './output/{source}_{driving}....mp4')
     ap.add_argument('--frame-processor',   nargs='+',
                     default=['face_swapper'],
                     choices=['face_swapper', 'face_enhancer',
@@ -339,9 +419,19 @@ def main():
     import modules.globals as gbl
     from modules.processors.frame.core import get_frame_processors_modules
 
+    output_path = None
+    output_tmp_path = None
+    if args.output:
+        output_path = _default_output_path(args.source, args.driving)
+        # cv2.VideoWriter's mp4v fourcc doesn't reliably finalize the MP4
+        # container (moov atom ends up missing even after release()) —
+        # write to a temp AVI, which OpenCV always finalizes cleanly, then
+        # transcode to a proper H.264 MP4 with ffmpeg on shutdown.
+        output_tmp_path = str(Path(output_path).with_suffix('.tmp.avi'))
+
     gbl.source_path        = args.source
-    gbl.target_path        = None          # live webcam — no file target
-    gbl.output_path        = None
+    gbl.target_path        = args.driving if not _is_camera_index(args.driving) else None
+    gbl.output_path        = output_path
     gbl.frame_processors   = args.frame_processor
     gbl.headless           = True
     gbl.keep_fps           = True
@@ -420,15 +510,31 @@ def main():
         return
     print(f"[init] Source face loaded from {gbl.source_path}")
 
-    # ── start camera + streamer ─────────────────────────────────────────────
-    cam      = WebcamCapture(args.camera_index, args.width, args.height, args.fps)
+    # ── start capture + streamer ────────────────────────────────────────────
+    cam      = DrivingCapture(args.driving, args.width, args.height, args.fps, loop=args.loop)
     streamer = MJPEGStreamer(port=args.port, jpeg_quality=args.jpeg_quality)
+    writer: cv2.VideoWriter | None = None   # lazily opened on the first frame
 
     # ── graceful shutdown ───────────────────────────────────────────────────
     def _shutdown(sig=None, frame=None):
         print("\n[main] Shutting down …")
         cam.stop()
         streamer.stop()
+        if writer is not None:
+            writer.release()
+            print(f"[output] Encoding {output_path} …")
+            result = subprocess.run(
+                ['ffmpeg', '-y', '-i', output_tmp_path,
+                 '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movflags', '+faststart',
+                 output_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                os.remove(output_tmp_path)
+                print(f"[output] Saved {output_path}")
+            else:
+                print(f"[error] ffmpeg encode failed, raw frames kept at "
+                      f"{output_tmp_path}:\n{result.stderr[-2000:]}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT,  _shutdown)
@@ -445,6 +551,10 @@ def main():
     cached_target_face = None
 
     while True:
+        if cam.finished():
+            print("[main] Driving video reached the end — stopping.")
+            _shutdown()
+
         bgr = cam.read()
         if bgr is None:
             time.sleep(0.005)
@@ -489,6 +599,17 @@ def main():
             # Don't crash the loop on a single bad frame (e.g. no face detected)
             print(f"[warn] process_frame error: {exc}")
             continue
+
+        # Save the swapped (BGR) frame to disk, opening the writer lazily on
+        # the first frame since only then do we know the actual frame size.
+        if output_path is not None:
+            if writer is None:
+                h, w = temp_frame.shape[:2]
+                writer = cv2.VideoWriter(
+                    output_tmp_path, cv2.VideoWriter_fourcc(*'XVID'), cam.fps, (w, h)
+                )
+                print(f"[output] Recording to {output_path}  {w}x{h}  {cam.fps:.1f} fps")
+            writer.write(temp_frame)
 
         # Convert BGR→RGB for the MJPEG streamer (push() expects RGB)
         rgb = cv2.cvtColor(temp_frame, cv2.COLOR_BGR2RGB)

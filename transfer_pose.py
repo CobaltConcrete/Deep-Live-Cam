@@ -374,7 +374,18 @@ def transplant_pose(pose_face, target_face):
         return target_face  # fallback: no pose info, swap normally
 
     try:
-        synthetic = copy.copy(pose_face)   # shallow copy — shares normed_embedding
+        # NOTE: deliberately NOT using copy.copy()/copy.deepcopy() here.
+        # insightface's Face class subclasses dict and overrides __getattr__
+        # to do dict-key lookups; this confuses the `copy` module's internal
+        # introspection (it probes dunder methods like __copy__/__reduce_ex__
+        # via getattr, and Face's __getattr__ can return None for some
+        # insightface versions instead of raising AttributeError), which then
+        # gets called as a function → "'NoneType' object is not callable".
+        # Instead we build a synthetic Face from scratch, copying over only
+        # the fields the swapper actually reads.
+        from insightface.app.common import Face
+
+        synthetic = Face(pose_face)   # Face(dict) -> shallow dict copy via dict.__init__
 
         # ── 5-point keypoints from both faces ───────────────────────────────
         # insightface kps layout: [left_eye, right_eye, nose, left_mouth, right_mouth]
@@ -462,7 +473,7 @@ def parse_args():
                     help="Re-detect faces every N frames (default: auto from --fps)")
     # Execution
     ap.add_argument("--execution-provider", nargs="+",
-                    default=[suggest_default_execution_provider()],
+                    default="cuda",
                     choices=suggest_execution_providers(),
                     dest="execution_provider")
     ap.add_argument("--execution-threads", type=int, default=None,
